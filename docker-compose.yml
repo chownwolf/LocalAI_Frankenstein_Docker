@@ -1,0 +1,552 @@
+services:
+  open-webui:
+    container_name: open-webui
+    image: ghcr.io/open-webui/open-webui:main
+    environment:
+      - MODEL_DOWNLOAD_DIR=/models
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - LOG_LEVEL=info
+      # Demo-only secret key - generate a real one for production:
+      # openssl rand -base64 32
+      - WEBUI_SECRET_KEY=demo-local-only-k8s7x9m2p4q6r8t0
+      # Suppress CORS warning for local-only use
+      - CORS_ALLOW_ORIGIN=http://localhost:8080
+    volumes:
+      - data:/data
+      - models:/models
+      - open-webui:/app/backend/data
+    ports:
+      - "8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ollama-net
+    restart: unless-stopped
+
+  # docker-compose.yml
+networks:
+  default:
+    external: true
+    name: localai_ollama-net
+
+
+  traefik:
+    image: traefik:v3.6
+    container_name: traefik-rt
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "8881:80"
+      - "8882:8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ollama-net
+    restart: unless-stopped
+
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:latest
+    environment:
+      # GPU/Performance tuning for RTX 5000 (16GB VRAM)
+      - OLLAMA_FLASH_ATTENTION=1
+      # Keep models loaded in memory (default 5m, set to 24h for local use)
+      - OLLAMA_KEEP_ALIVE=24h
+      # Number of models to keep loaded simultaneously (RAM permitting)
+      - OLLAMA_MAX_LOADED_MODELS=2
+      # Concurrent request handling (tune based on model size)
+      - OLLAMA_NUM_PARALLEL=4
+      # Use all available VRAM
+      - OLLAMA_GPU_OVERHEAD=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+    volumes:
+      - ollama:/root/.ollama
+      - models:/models
+    ports:
+      - "11434:11434"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - ollama-net
+    restart: unless-stopped
+
+  # watchtower:
+  #   container_name: watchtower
+  #   image: containrrr/watchtower
+  #   environment:
+  #     # Check for updates on first run
+  #     - WATCHTOWER_RUN_ONCE=false
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   # Check for updates every 6 hours (21600 seconds)
+  #   command: --interval 21600 open-webui ollama
+  #   depends_on:
+  #     - open-webui
+  #     - ollama
+  #   networks:
+  #     - ollama-net
+  #   restart: unless-stopped
+
+  # ============================================================================
+  # MODEL SETUP SERVICES (on-demand via profiles)
+  # ============================================================================
+  #
+  # Usage:
+  #   docker compose --profile <profile> up --force-recreate
+  #
+  # Individual Models:
+  #   docker compose --profile qwen3-coder up          # Q3: Qwen3 Coder 30B MOE
+  #   docker compose --profile qwen25-coder-32b up     # Q3: Qwen2.5 Coder 32B
+  #   docker compose --profile qwen3-coder-unsloth up  # Tool: Qwen3-Coder 30B (SOTA)
+  #   docker compose --profile watt-tool-8b up         # Tool: Watt-Tool 8B
+  #   docker compose --profile groq-tool-8b up         # Tool: Groq Tool-Use 8B
+  #   docker compose --profile darkest-universe up     # Q4: Darkest Universe 29B
+  #
+  # Group Profiles:
+  #   docker compose --profile baseline up             # All Q1 baseline models
+  #   docker compose --profile bold up                 # All Q2 modified models
+  #   docker compose --profile coder up                # All coder models (3 tiers)
+  #   docker compose --profile tool up                 # All tool-calling models
+  #   docker compose --profile specialized up          # All Q3 specialized models
+  #   docker compose --profile grey-zone up            # All Q4 research models
+  #   docker compose --profile all up                  # Everything (~100GB+)
+  #
+  # List all profiles:
+  #   docker compose config --profiles
+  #
+  # These services download GGUFs, create Modelfiles, and register with Ollama.
+  # Files persist in the 'models' volume across restarts.
+  # ============================================================================
+
+  # ---------------------------------------------------------------------------
+  # Q1: BASELINE MODELS
+  # ---------------------------------------------------------------------------
+
+  # Qwen 2.5 14B - Baseline coding/JSON model
+  setup-qwen25-14b:
+    profiles: ["qwen25-14b", "baseline", "all"]
+    image: ollama/ollama:latest
+    container_name: setup-qwen25-14b
+    depends_on:
+      - ollama
+    networks:
+      - ollama-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "==> Pulling qwen2.5:14b from Ollama library..."
+        ollama pull qwen2.5:14b
+        echo "==> Done! Model ready: qwen2.5:14b"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+
+ 
+  # ---------------------------------------------------------------------------
+  # Q3: SPECIALIZED MODELS - CODER TIER (Sane → Insane)
+  # ---------------------------------------------------------------------------
+  #
+  # Three coder models for security research - understanding attacker capability:
+  #   - Sane:   qwen3-coder-30b-a3b      (~8GB)  - MOE, fast, from Ollama
+  #   - Bold:   qwen3-coder-abliterated  (~17GB) - MOE, uncensored
+  #
+  # Usage:
+  #   docker compose --profile coder up              # All coder models
+  #   docker compose --profile qwen3-coder up        # Just the sane one
+  # ---------------------------------------------------------------------------
+
+  # Qwen 2.5 Coder 14B - Baseline dedicated coding model (LEGACY - keeping for compatibility)
+  setup-qwen25-coder:
+    profiles: ["qwen25-coder", "specialized", "all"]
+    image: ollama/ollama:latest
+    container_name: setup-qwen25-coder
+    depends_on:
+      - ollama
+    networks:
+      - ollama-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "==> Pulling qwen2.5-coder:14b from Ollama library..."
+        ollama pull qwen2.5-coder:14b
+        echo "==> Done! Model ready: qwen2.5-coder:14b"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+
+  # ---------------------------------------------------------------------------
+  # CODER TIER 1: SANE - Qwen3 Coder 30B-A3B MOE (~8GB active)
+  # ---------------------------------------------------------------------------
+  # 30B params but only 3B active per token - runs fast despite size
+  # From Ollama library - no GGUF download needed
+  setup-qwen3-coder:
+    profiles: ["qwen3-coder", "coder", "specialized", "all"]
+    image: ollama/ollama:latest
+    container_name: setup-qwen3-coder
+    depends_on:
+      - ollama
+    networks:
+      - ollama-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "==> Pulling qwen3-coder:30b-a3b from Ollama library..."
+        echo "==> This is a 30B MOE with only ~3B active - runs fast!"
+        ollama pull qwen3-coder:30b-a3b
+        echo "==> Done! Model ready: qwen3-coder:30b-a3b"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+
+  # ---------------------------------------------------------------------------
+  # CODER TIER 2: BOLD - Qwen3 Coder 30B-A3B Abliterated (~17GB)
+  # ---------------------------------------------------------------------------
+  # Uncensored MOE coder - for understanding adversarial code generation
+  # Source: mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF
+  setup-qwen3-coder-abliterated:
+    profiles: ["qwen3-coder-abliterated", "coder", "specialized", "all"]
+    image: curlimages/curl:latest
+    container_name: setup-qwen3-coder-abliterated
+    user: root
+    volumes:
+      - models:/models
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        GGUF_FILE="/models/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-IQ4_XS.gguf"
+        GGUF_URL="https://huggingface.co/mradermacher/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated-i1-GGUF/resolve/main/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-IQ4_XS.gguf"
+        if [ -f "$$GGUF_FILE" ]; then
+          echo "==> GGUF already exists, skipping download"
+        else
+          echo "==> Downloading Qwen3-Coder-30B-A3B-abliterated (~16GB)..."
+          echo "==> MOE architecture - 30B params, ~3B active per token"
+          curl -L --progress-bar -o "$$GGUF_FILE" "$$GGUF_URL"
+        fi
+        echo "==> Download complete."
+  register-qwen3-coder-abliterated:
+    profiles: ["qwen3-coder-abliterated", "coder", "specialized", "all"]
+    image: ollama/ollama:latest
+    container_name: register-qwen3-coder-abliterated
+    depends_on:
+      ollama:
+        condition: service_started
+      setup-qwen3-coder-abliterated:
+        condition: service_completed_successfully
+    networks:
+      - ollama-net
+    volumes:
+      - models:/models
+      - ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        MODEL_NAME="qwen3-coder-abliterated"
+        GGUF_FILE="/models/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-IQ4_XS.gguf"
+        if [ ! -f "$$GGUF_FILE" ]; then
+          echo "ERROR: GGUF file not found."
+          exit 1
+        fi
+        echo "==> Creating Modelfile..."
+        printf '%s\n' \
+          'FROM /models/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-IQ4_XS.gguf' \
+          '' \
+          'PARAMETER temperature 0.7' \
+          'PARAMETER top_p 0.8' \
+          'PARAMETER top_k 20' \
+          'PARAMETER repeat_penalty 1.05' \
+          'PARAMETER num_ctx 32768' \
+          '' \
+          'TEMPLATE """{{- if .System }}<|im_start|>system' \
+          '{{ .System }}<|im_end|>' \
+          '{{ end }}<|im_start|>user' \
+          '{{ .Prompt }}<|im_end|>' \
+          '<|im_start|>assistant' \
+          '"""' \
+          '' \
+          'SYSTEM """You are an expert coding assistant. Provide direct, helpful code solutions."""' \
+          > /models/Modelfile.qwen3-coder-abliterated
+        echo "==> Waiting for Ollama..."
+        until ollama list > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "==> Registering model with Ollama..."
+        ollama create $$MODEL_NAME -f /models/Modelfile.qwen3-coder-abliterated
+        echo ""
+        echo "==> Done! Model ready: $$MODEL_NAME"
+  
+  # ---------------------------------------------------------------------------
+  # TOOL-CALLING MODELS - For Agentic Coding (OpenCode, Goose, Claude proxies)
+  # ---------------------------------------------------------------------------
+  #
+  # These models have proper tool/function calling support for use with:
+  #   - OpenCode CLI
+  #   - Goose
+  #   - Claude Code (behind intercept proxy)
+  #   - Any agentic coding assistant
+  #
+  # Usage:
+  #   docker compose --profile tool up              # All tool-calling models
+  #   docker compose --profile watt-tool-8b up      # Just watt-tool
+  #   docker compose --profile groq-tool-8b up      # Just Groq tool-use
+  # ---------------------------------------------------------------------------
+
+  # Watt-Tool-8B - Purpose-built for tool/function calling (~6GB)
+  # Source: mradermacher/watt-tool-8B-GGUF
+  setup-watt-tool-8b:
+    profiles: ["watt-tool-8b", "tool", "all"]
+    image: curlimages/curl:latest
+    container_name: setup-watt-tool-8b
+    user: root
+    volumes:
+      - models:/models
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        GGUF_FILE="/models/watt-tool-8B.Q5_K_M.gguf"
+        GGUF_URL="https://huggingface.co/mradermacher/watt-tool-8B-GGUF/resolve/main/watt-tool-8B.Q5_K_M.gguf"
+        if [ -f "$$GGUF_FILE" ]; then
+          echo "==> GGUF already exists, skipping download"
+        else
+          echo "==> Downloading watt-tool-8B (~6GB)..."
+          echo "==> Purpose-built for tool/function calling"
+          curl -L --progress-bar -o "$$GGUF_FILE" "$$GGUF_URL"
+        fi
+        echo "==> Download complete."
+  register-watt-tool-8b:
+    profiles: ["watt-tool-8b", "tool", "all"]
+    image: ollama/ollama:latest
+    container_name: register-watt-tool-8b
+    depends_on:
+      ollama:
+        condition: service_started
+      setup-watt-tool-8b:
+        condition: service_completed_successfully
+    networks:
+      - ollama-net
+    volumes:
+      - models:/models
+      - ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        MODEL_NAME="watt-tool-8b"
+        GGUF_FILE="/models/watt-tool-8B.Q5_K_M.gguf"
+        if [ ! -f "$$GGUF_FILE" ]; then
+          echo "ERROR: GGUF file not found."
+          exit 1
+        fi
+        echo "==> Creating Modelfile..."
+        printf '%s\n' \
+          'FROM /models/watt-tool-8B.Q5_K_M.gguf' \
+          '' \
+          'PARAMETER temperature 0.7' \
+          'PARAMETER top_p 0.9' \
+          'PARAMETER num_ctx 8192' \
+          '' \
+          'TEMPLATE """{{- if .System }}<|begin_of_text|><|start_header_id|>system<|end_header_id|>' \
+          '' \
+          '{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>' \
+          '' \
+          '{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>' \
+          '' \
+          '{{ .Response }}<|eot_id|>"""' \
+          '' \
+          'SYSTEM """You are a helpful AI assistant with tool/function calling capabilities. Execute tools accurately when requested."""' \
+          > /models/Modelfile.watt-tool-8b
+        echo "==> Waiting for Ollama..."
+        until ollama list > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "==> Registering model with Ollama..."
+        ollama create $$MODEL_NAME -f /models/Modelfile.watt-tool-8b
+        echo ""
+        echo "==> Done! Model ready: $$MODEL_NAME"
+        echo "==> Supports tool/function calling for agentic coding"
+  # Qwen3-Coder-30B-A3B (Unsloth) - SOTA agentic coder with tool calling (~15GB)
+  # Source: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+  # NOTE: Native tool calling support for Cline, OpenCode, etc.
+  setup-qwen3-coder-unsloth:
+    profiles: ["qwen3-coder-unsloth", "tool", "coder", "all"]
+    image: curlimages/curl:latest
+    container_name: setup-qwen3-coder-unsloth
+    user: root
+    volumes:
+      - models:/models
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        GGUF_FILE="/models/Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf"
+        GGUF_URL="https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf"
+        if [ -f "$$GGUF_FILE" ]; then
+          echo "==> GGUF already exists, skipping download"
+        else
+          echo "==> Downloading Qwen3-Coder-30B-A3B Unsloth (~15GB)..."
+          echo "==> SOTA agentic coder with native tool calling"
+          echo "==> MOE: 30B params, ~3B active per token"
+          curl -L --progress-bar -o "$$GGUF_FILE" "$$GGUF_URL"
+        fi
+        echo "==> Download complete."
+  register-qwen3-coder-unsloth:
+    profiles: ["qwen3-coder-unsloth", "tool", "coder", "all"]
+    image: ollama/ollama:latest
+    container_name: register-qwen3-coder-unsloth
+    depends_on:
+      ollama:
+        condition: service_started
+      setup-qwen3-coder-unsloth:
+        condition: service_completed_successfully
+    networks:
+      - ollama-net
+    volumes:
+      - models:/models
+      - ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        MODEL_NAME="qwen3-coder-unsloth"
+        GGUF_FILE="/models/Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf"
+        if [ ! -f "$$GGUF_FILE" ]; then
+          echo "ERROR: GGUF file not found."
+          exit 1
+        fi
+        echo "==> Creating Modelfile..."
+        printf '%s\n' \
+          'FROM /models/Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf' \
+          '' \
+          'PARAMETER temperature 0.7' \
+          'PARAMETER top_p 0.8' \
+          'PARAMETER top_k 20' \
+          'PARAMETER repeat_penalty 1.05' \
+          'PARAMETER num_ctx 32768' \
+          '' \
+          'TEMPLATE """{{- if .System }}<|im_start|>system' \
+          '{{ .System }}<|im_end|>' \
+          '{{ end }}<|im_start|>user' \
+          '{{ .Prompt }}<|im_end|>' \
+          '<|im_start|>assistant' \
+          '{{ .Response }}<|im_end|>"""' \
+          '' \
+          'SYSTEM """You are Qwen3-Coder, an expert AI coding assistant with tool/function calling capabilities."""' \
+          > /models/Modelfile.qwen3-coder-unsloth
+        echo "==> Waiting for Ollama..."
+        until ollama list > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "==> Registering model with Ollama..."
+        ollama create $$MODEL_NAME -f /models/Modelfile.qwen3-coder-unsloth
+        echo ""
+        echo "==> Done! Model ready: $$MODEL_NAME"
+        echo "==> SOTA agentic coder with native tool calling"
+  # Llama-3-Groq-8B-Tool-Use - Popular Groq fine-tune for tool use (~6GB)
+  # Source: bartowski/Llama-3-Groq-8B-Tool-Use-GGUF
+  setup-groq-tool-8b:
+    profiles: ["groq-tool-8b", "tool", "all"]
+    image: curlimages/curl:latest
+    container_name: setup-groq-tool-8b
+    user: root
+    volumes:
+      - models:/models
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        GGUF_FILE="/models/Llama-3-Groq-8B-Tool-Use-Q5_K_M.gguf"
+        GGUF_URL="https://huggingface.co/bartowski/Llama-3-Groq-8B-Tool-Use-GGUF/resolve/main/Llama-3-Groq-8B-Tool-Use-Q5_K_M.gguf"
+        if [ -f "$$GGUF_FILE" ]; then
+          echo "==> GGUF already exists, skipping download"
+        else
+          echo "==> Downloading Llama-3-Groq-8B-Tool-Use (~6GB)..."
+          echo "==> Groq fine-tune optimized for tool/function calling"
+          curl -L --progress-bar -o "$$GGUF_FILE" "$$GGUF_URL"
+        fi
+        echo "==> Download complete."
+  register-groq-tool-8b:
+    profiles: ["groq-tool-8b", "tool", "all"]
+    image: ollama/ollama:latest
+    container_name: register-groq-tool-8b
+    depends_on:
+      ollama:
+        condition: service_started
+      setup-groq-tool-8b:
+        condition: service_completed_successfully
+    networks:
+      - ollama-net
+    volumes:
+      - models:/models
+      - ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        MODEL_NAME="groq-tool-8b"
+        GGUF_FILE="/models/Llama-3-Groq-8B-Tool-Use-Q5_K_M.gguf"
+        if [ ! -f "$$GGUF_FILE" ]; then
+          echo "ERROR: GGUF file not found."
+          exit 1
+        fi
+        echo "==> Creating Modelfile..."
+        printf '%s\n' \
+          'FROM /models/Llama-3-Groq-8B-Tool-Use-Q5_K_M.gguf' \
+          '' \
+          'PARAMETER temperature 0.7' \
+          'PARAMETER top_p 0.9' \
+          'PARAMETER num_ctx 8192' \
+          '' \
+          'TEMPLATE """{{- if .System }}<|begin_of_text|><|start_header_id|>system<|end_header_id|>' \
+          '' \
+          '{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>' \
+          '' \
+          '{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>' \
+          '' \
+          '{{ .Response }}<|eot_id|>"""' \
+          '' \
+          'SYSTEM """You are a helpful AI assistant with tool/function calling capabilities. Execute tools accurately when requested."""' \
+          > /models/Modelfile.groq-tool-8b
+        echo "==> Waiting for Ollama..."
+        until ollama list > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "==> Registering model with Ollama..."
+        ollama create $$MODEL_NAME -f /models/Modelfile.groq-tool-8b
+        echo ""
+        echo "==> Done! Model ready: $$MODEL_NAME"
+        echo "==> Groq fine-tune - excellent for tool/function calling"
+  
+volumes:
+  data:
+  models:
+  ollama:
+  open-webui:
+
+networks:
+  ollama-net:
+    driver: bridge
